@@ -1,22 +1,30 @@
-import asyncio
 import json
 import uuid
 import time
 import logging
 import shutil
 import subprocess
-from typing import Dict, List, Optional, Set
+from typing import Dict, Set
 
-from libnmap.process import NmapProcess
 from libnmap.parser import NmapParser
-from mcp.server.models import InitializationOptions
 import mcp.types as types
-from mcp.server import NotificationOptions, Server
+from mcp.server import Server
 from pydantic import AnyUrl
-import mcp.server.stdio
+import contextlib
+from collections.abc import AsyncIterator
+
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.routing import Route, Mount
+from starlette.types import Scope, Receive, Send
+
+from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("nmap-mcp")
 
 # Store scan results as a dictionary with scan_id as the key
@@ -41,6 +49,7 @@ logger.info(f"Using nmap executable at: {NMAP_PATH}")
 
 server = Server("nmap")
 
+
 @server.list_resources()
 async def handle_list_resources() -> list[types.Resource]:
     """
@@ -57,6 +66,7 @@ async def handle_list_resources() -> list[types.Resource]:
         for scan_id, scan_data in scan_results.items()
     ]
 
+
 @server.read_resource()
 async def handle_read_resource(uri: AnyUrl) -> str:
     """
@@ -72,6 +82,7 @@ async def handle_read_resource(uri: AnyUrl) -> str:
         if scan_id in scan_results:
             return json.dumps(scan_results[scan_id], indent=2)
     raise ValueError(f"Scan result not found: {scan_id}")
+
 
 @server.list_prompts()
 async def handle_list_prompts() -> list[types.Prompt]:
@@ -92,15 +103,14 @@ async def handle_list_prompts() -> list[types.Prompt]:
                     name="focus",
                     description="Focus area (security/services/overview)",
                     required=False,
-                )
+                ),
             ],
         )
     ]
 
+
 @server.get_prompt()
-async def handle_get_prompt(
-    name: str, arguments: dict[str, str] | None
-) -> types.GetPromptResult:
+async def handle_get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
     """
     Generate a prompt for analyzing nmap scan results.
     """
@@ -117,7 +127,7 @@ async def handle_get_prompt(
         raise ValueError(f"Scan result not found: {scan_id}")
 
     scan_data = scan_results[scan_id]
-    
+
     focus_prompt = ""
     if focus == "security":
         focus_prompt = "Focus on security vulnerabilities and potential risks."
@@ -139,6 +149,7 @@ async def handle_get_prompt(
         ],
     )
 
+
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     """
@@ -151,7 +162,10 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "target": {"type": "string", "description": "Target host or network (e.g., 192.168.1.1 or 192.168.1.0/24)"},
+                    "target": {
+                        "type": "string",
+                        "description": "Target host or network (e.g., 192.168.1.1 or 192.168.1.0/24)",
+                    },
                     "options": {"type": "string", "description": "Nmap options (e.g., -sV -p 1-1000)"},
                 },
                 "required": ["target"],
@@ -175,53 +189,52 @@ async def handle_list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {},
             },
-        )
+        ),
     ]
+
 
 def check_rate_limit() -> bool:
     """Check if we're exceeding the rate limit."""
     global last_scan_times
     current_time = time.time()
-    
+
     # Remove timestamps older than the rate limit period
     last_scan_times = [t for t in last_scan_times if current_time - t < RATE_LIMIT_PERIOD]
-    
+
     # Check if we're under the limit
     return len(last_scan_times) < RATE_LIMIT_MAX_SCANS
+
 
 def add_scan_timestamp():
     """Add current timestamp to track rate limiting."""
     global last_scan_times
     last_scan_times.append(time.time())
 
+
 def run_nmap_directly(target, options):
     """Run nmap directly using subprocess instead of relying on python-libnmap."""
     try:
         # Construct the basic command with XML output
         cmd = [NMAP_PATH, "-oX", "-"]
-        
+
         # Split options into separate arguments
         if options:
             option_args = options.split()
             cmd.extend(option_args)
-            
+
         # Add target at the end
         cmd.append(target)
         logger.info(f"Executing nmap command: {' '.join(cmd)}")
-        
+
         # Run the command and capture both stdout and stderr
-        process = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=False,
-            check=True
-        )
-        
+        process = subprocess.run(cmd, capture_output=True, text=False, check=True)
+
         return process.stdout, None
     except subprocess.CalledProcessError as e:
         return None, f"nmap failed with exit code {e.returncode}: {e.stderr.decode('utf-8', errors='replace')}"
     except Exception as e:
         return None, str(e)
+
 
 @server.call_tool()
 async def handle_call_tool(
@@ -239,19 +252,19 @@ async def handle_call_tool(
 
         if not target:
             raise ValueError("Missing target")
-            
+
         # Create a unique scan identifier based on target and options
         scan_key = f"{target}:{options}"
-        
+
         # Check if an identical scan is already running
         if scan_key in ongoing_scans:
             return [
                 types.TextContent(
                     type="text",
-                    text=f"A scan with the same target and options is already running. Please wait for it to complete.",
+                    text="A scan with the same target and options is already running. Please wait for it to complete.",
                 )
             ]
-            
+
         # Check rate limiting
         if not check_rate_limit():
             return [
@@ -260,17 +273,17 @@ async def handle_call_tool(
                     text=f"Rate limit exceeded. Please wait before starting another scan. Maximum {RATE_LIMIT_MAX_SCANS} scans per {RATE_LIMIT_PERIOD} seconds.",
                 )
             ]
-            
+
         try:
             # Mark this scan as ongoing
             ongoing_scans.add(scan_key)
             add_scan_timestamp()
-            
+
             logger.info(f"Starting nmap scan on {target} with options {options}")
-            
+
             # Use direct subprocess call instead of NmapProcess
             stdout, stderr = run_nmap_directly(target, options)
-            
+
             if stderr:
                 logger.error(f"Nmap scan failed: {stderr}")
                 return [
@@ -282,7 +295,7 @@ async def handle_call_tool(
 
             # Parse results - convert bytes to string first
             try:
-                xml_string = stdout.decode('utf-8', errors='replace')
+                xml_string = stdout.decode("utf-8", errors="replace")
                 parsed = NmapParser.parse_fromstring(xml_string)
             except Exception as e:
                 logger.error(f"Error parsing nmap results: {str(e)}")
@@ -292,10 +305,10 @@ async def handle_call_tool(
                         text=f"Error parsing nmap results: {str(e)}",
                     )
                 ]
-            
+
             # Generate a unique ID for this scan
             scan_id = str(uuid.uuid4())
-            
+
             # Store scan results
             scan_results[scan_id] = {
                 "target": target,
@@ -306,8 +319,7 @@ async def handle_call_tool(
                         "address": host.address,
                         "status": host.status,
                         "hostnames": [
-                            hostname.name if hasattr(hostname, 'name') else str(hostname)
-                            for hostname in host.hostnames
+                            hostname.name if hasattr(hostname, "name") else str(hostname) for hostname in host.hostnames
                         ],
                         "services": [
                             {
@@ -315,20 +327,20 @@ async def handle_call_tool(
                                 "protocol": service.protocol,
                                 "state": service.state,
                                 "service": service.service,
-                                "banner": service.banner
+                                "banner": service.banner,
                             }
                             for service in host.services
-                        ]
+                        ],
                     }
                     for host in parsed.hosts
-                ]
+                ],
             }
-            
+
             # Notify clients that new resources are available
             await server.request_context.session.send_resource_list_changed()
-            
+
             logger.info(f"Scan completed. Found {len(parsed.hosts)} hosts. Scan ID: {scan_id}")
-            
+
             return [
                 types.TextContent(
                     type="text",
@@ -346,13 +358,13 @@ async def handle_call_tool(
         finally:
             # Remove from ongoing scans when done
             ongoing_scans.discard(scan_key)
-            
+
     elif name == "get-scan-details":
         scan_id = arguments.get("scan_id")
-        
+
         if not scan_id:
             raise ValueError("Missing scan_id")
-            
+
         if scan_id not in scan_results:
             return [
                 types.TextContent(
@@ -360,22 +372,22 @@ async def handle_call_tool(
                     text=f"Scan with ID {scan_id} not found",
                 )
             ]
-            
+
         scan_data = scan_results[scan_id]
-        
+
         # Extract summary information
         hosts_up = sum(1 for host in scan_data.get("hosts", []) if host.get("status") == "up")
         total_ports = sum(len(host.get("services", [])) for host in scan_data.get("hosts", []))
-        
+
         return [
             types.TextContent(
                 type="text",
                 text=f"Scan of {scan_data.get('target')} (ID: {scan_id}):\n"
-                     f"- Options: {scan_data.get('options')}\n"
-                     f"- Timestamp: {scan_data.get('timestamp')}\n"
-                     f"- Hosts: {len(scan_data.get('hosts', []))} ({hosts_up} up)\n"
-                     f"- Total ports/services: {total_ports}\n\n"
-                     f"Use the nmap://scan/{scan_id} resource to access full results",
+                f"- Options: {scan_data.get('options')}\n"
+                f"- Timestamp: {scan_data.get('timestamp')}\n"
+                f"- Hosts: {len(scan_data.get('hosts', []))} ({hosts_up} up)\n"
+                f"- Total ports/services: {total_ports}\n\n"
+                f"Use the nmap://scan/{scan_id} resource to access full results",
             )
         ]
     elif name == "list-all-scans":
@@ -386,7 +398,7 @@ async def handle_call_tool(
                     text="No scans have been performed yet.",
                 )
             ]
-            
+
         scan_list = []
         for scan_id, scan_data in scan_results.items():
             hosts_count = len(scan_data.get("hosts", []))
@@ -395,7 +407,7 @@ async def handle_call_tool(
             scan_list.append(f"  Options: {scan_data.get('options')}")
             scan_list.append(f"  Hosts: {hosts_count}")
             scan_list.append("")
-            
+
         return [
             types.TextContent(
                 type="text",
@@ -405,19 +417,65 @@ async def handle_call_tool(
     else:
         raise ValueError(f"Unknown tool: {name}")
 
-async def main():
-    logger.info("Starting nmap MCP server")
-    # Run the server using stdin/stdout streams
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="nmap",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+
+def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
+    sse = SseServerTransport("/messages/")
+
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_server,
+        event_store=None,
+        json_response=True,
+        stateless=True,
+    )
+
+    async def handle_sse(request: Request) -> None:
+        async with sse.connect_sse(
+            request.scope,
+            request.receive,
+            request._send,
+        ) as (read_stream, write_stream):
+            await mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp_server.create_initialization_options(),
+            )
+
+    async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
+        await session_manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        async with session_manager.run():
+            logger.info("Nmap MCP HTTP server started")
+            try:
+                yield
+            finally:
+                logger.info("Nmap MCP HTTP server shutting down")
+
+    return Starlette(
+        debug=debug,
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/mcp", app=handle_streamable_http),
+            Mount("/messages/", app=sse.handle_post_message),
+        ],
+        lifespan=lifespan,
+    )
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run nmap MCP HTTP server")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=3001)
+
+    args = parser.parse_args()
+
+    app = create_starlette_app(server, debug=True)
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+    )
