@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "nmap-mcp"
 version = "0.1.0"
@@ -6,19 +10,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
-    "mcp>=1.4.1",
-    "python-libnmap>=0.7.2"
+    "fastmcp>=2.14.5",
+    "python-nmap>=0.7.1"
 ]
-
-[build-system]
-requires = [ "hatchling",]
-build-backend = "hatchling.build"
 
 [project.scripts]
 nmap-mcp = "nmap_mcp:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/nmap_mcp"]
+[tool.setuptools]
+package-dir = {"" = "src"}
 
-[tool.hatch.build]
-packages = ["src"]
+[tool.setuptools.packages.find]
+where = ["src"]
